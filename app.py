@@ -1,7 +1,7 @@
 """
 FarmWise AI - Farmer Assistant Tool
 Powered by Anthropic Claude API + Open-Meteo (live weather)
-Features: Live weather, AI chat, Photo disease diagnosis, Twi language support
+Features: Live weather for all Ghana regions, AI chat, Photo disease diagnosis, Twi language support
 
 Run:
     pip install flask anthropic requests gunicorn
@@ -13,7 +13,6 @@ Then open: http://localhost:5000
 
 import os
 import json
-import base64
 import requests
 import anthropic
 from flask import Flask, render_template, request, jsonify, stream_with_context, Response
@@ -49,15 +48,12 @@ wɔ Ghana ne Atɔeɛ Afrika mu. Woboa wɔn ho asɛm a ɛfa:
 1. ƆHAW NE NSUO HOHOROW - kyerɛ osu ho asɛm, ka wɔn ho asɛm faako wɔn hwehwɛ nsuo, 
    ɛberɛ a ɛsɛ sɛ wɔdua aba, ne ɔhaw a osu bɛma wɔn afuo mu aba.
 2. AGUADI TENTEENE - ka wɔn ho asɛm faako wɔn tɔ adwuma ho gɔdo, ɛberɛ a ɛsɛ sɛ wɔtɔn 
-   wɔn aba, ne wuramu tenteene a ɛfa bɔrɔdeɛ, bankye, ntomato, ɔgede, bayerɛ, kookoo, 
-   ne nnuaba foforo a wɔdua wɔ Ghana.
-3. MMOA YAREƐ NHYEHYƐE - kyerɛ nsɛnkyerɛnne, ka wɔn ho asɛm faako aduro a wɔbɛtumi 
-   de ayɛ, ne mmara a ɛbɛboa wɔn fi mmoa tia wɔn afuo ho.
+   wɔn aba, ne wuramu tenteene.
+3. MMOA YAREƐ NHYEHYƐE - kyerɛ nsɛnkyerɛnne, ka wɔn ho asɛm faako aduro.
 4. DUA ABA NHYEHYƐE - afuo aba bɛn na ɛfata ɔberɛ no, asaase no, ne osu no.
 
 Fa asɛm a ɛho hia, a wɔbɛtumi ayɛ, na ɛka nnomkuo nkuraasefoɔ afuom adwumayɛfoɔ ho.
-Ka asɛm no ntɛm, dwoodwoo, na sɔ wɔn da. Fa kasa a ɛyɛ mmerɛw. Sɛ asɛm no ho hia a, 
-fa afuo aba din a wɔde frɛ wɔn wɔ Ghana ne aguadi baabi (Kumasi, Accra, Tamale).
+Ka asɛm no ntɛm, dwoodwoo, na sɔ wɔn da.
 """
 
 DISEASE_PROMPT_EN = """You are an expert plant pathologist for Ghana and West Africa crops.
@@ -82,31 +78,54 @@ Hwɛ saa afuo foto yi na ka:
 2. ABA A ƐWƆ SO - hunu aba no sɛ wohunu no
 3. YAREƐ TENTEN - Ketewa / Mfinimfini / Kɛseɛ
 4. NSƐNKYERƐNNE - nsɛnkyerɛnne a wohunu wɔ foto no mu
-5. ADURO - aduro a ɛyɛ mmerɛw na ɛho hia a nnomkuo afuom adwumayɛfoɔ wɔ Ghana bɛtumi de ayɛ
+5. ADURO - aduro a ɛyɛ mmerɛw
 6. BANBƆ - ɛdeɛn na wɔbɛtumi ayɛ sɛ eyi ammɛba bio
-
-Yɛ pɛpɛɛpɛ, na ka aduro a wɔtumi nya wɔ Ghana. Sɛ foto no nyɛ aba anaa nnua a, 
-ka no dɔɔso na bisa wɔn afuo foto.
 """
 
 # ---------------------------------------------------------------------------
-# Live weather from Open-Meteo
+# Ghana regions with coordinates
 # ---------------------------------------------------------------------------
-def get_weather():
+GHANA_REGIONS = {
+    "greater_accra":  {"name": "Greater Accra (Accra)",      "name_tw": "Accra Kuro",           "lat": 5.55,  "lon": -0.20},
+    "ashanti":        {"name": "Ashanti (Kumasi)",            "name_tw": "Ashanti (Kumasi)",      "lat": 6.69,  "lon": -1.62},
+    "northern":       {"name": "Northern (Tamale)",           "name_tw": "Atifi (Tamale)",        "lat": 9.40,  "lon": -0.85},
+    "central":        {"name": "Central (Cape Coast)",        "name_tw": "Mfinimfini (Cape Coast)","lat": 5.10, "lon": -1.25},
+    "bono":           {"name": "Bono (Sunyani)",              "name_tw": "Bono (Sunyani)",        "lat": 7.33,  "lon": -2.33},
+    "eastern":        {"name": "Eastern (Koforidua)",         "name_tw": "Apuei (Koforidua)",     "lat": 6.09,  "lon": -0.26},
+    "volta":          {"name": "Volta (Ho)",                  "name_tw": "Volta (Ho)",            "lat": 6.60,  "lon":  0.47},
+    "upper_west":     {"name": "Upper West (Wa)",             "name_tw": "Atifi Atɔeɛ (Wa)",     "lat": 10.06, "lon": -2.50},
+    "upper_east":     {"name": "Upper East (Bolgatanga)",     "name_tw": "Atifi Apuei (Bolgatanga)","lat": 10.79,"lon": -0.85},
+    "western":        {"name": "Western (Takoradi)",          "name_tw": "Atɔeɛ (Takoradi)",     "lat": 4.90,  "lon": -1.76},
+    "oti":            {"name": "Oti (Dambai)",                "name_tw": "Oti (Dambai)",          "lat": 7.97,  "lon":  0.18},
+    "bono_east":      {"name": "Bono East (Techiman)",        "name_tw": "Bono Apuei (Techiman)", "lat": 7.59,  "lon": -1.94},
+    "ahafo":          {"name": "Ahafo (Goaso)",               "name_tw": "Ahafo (Goaso)",         "lat": 6.80,  "lon": -2.52},
+    "western_north":  {"name": "Western North (Sefwi Wiawso)","name_tw": "Atɔeɛ Atifi (Sefwi)",  "lat": 6.20,  "lon": -2.47},
+    "north_east":     {"name": "North East (Nalerigu)",       "name_tw": "Atifi Apuei Foforɔ (Nalerigu)","lat": 10.52,"lon": -0.36},
+    "savannah":       {"name": "Savannah (Damongo)",          "name_tw": "Savannah (Damongo)",    "lat": 9.08,  "lon": -1.82},
+}
+
+# ---------------------------------------------------------------------------
+# Live weather from Open-Meteo — supports any Ghana region
+# ---------------------------------------------------------------------------
+def get_weather(region_key="greater_accra"):
+    region = GHANA_REGIONS.get(region_key, GHANA_REGIONS["greater_accra"])
+    lat    = region["lat"]
+    lon    = region["lon"]
+
     try:
         url = (
-            "https://api.open-meteo.com/v1/forecast"
-            "?latitude=5.55&longitude=-0.20"
-            "&daily=temperature_2m_max,precipitation_probability_max,windspeed_10m_max"
-            "&hourly=relativehumidity_2m"
-            "&forecast_days=7"
-            "&timezone=Africa%2FAccra"
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&daily=temperature_2m_max,precipitation_probability_max,windspeed_10m_max"
+            f"&hourly=relativehumidity_2m"
+            f"&forecast_days=7"
+            f"&timezone=Africa%2FAccra"
         )
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
 
-        daily = data["daily"]
+        daily     = data["daily"]
         day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
         def rain_icon(pct):
@@ -130,26 +149,27 @@ def get_weather():
         humidity   = data["hourly"]["relativehumidity_2m"][12]
 
         if today_rain >= 70:
-            advice     = "Heavy rain expected. Avoid spraying pesticides today. Check field drainage."
-            advice_tw  = "Osu kɛseɛ reba. Mma aduro gu afuo so nnɛ. Hwɛ sɛ nsuo bɛtumi afi afuo no mu."
+            advice     = f"Heavy rain expected in {region['name']}. Avoid spraying pesticides today. Check field drainage to prevent waterlogging."
+            advice_tw  = f"Osu kɛseɛ reba wɔ {region['name_tw']}. Mma aduro gu afuo so nnɛ. Hwɛ sɛ nsuo bɛtumi afi afuo no mu."
             risk       = "High flood / waterlogging risk"
             risk_tw    = "Osu kɛseɛ tumi de ɔhaw ba"
             risk_level = "danger"
         elif today_rain >= 40:
-            advice     = "Moderate rain likely. Skip irrigation on rainy days to conserve water."
-            advice_tw  = "Osu kakra reba. Mma nsuo gu afuo so da a osu ba no."
+            advice     = f"Moderate rain likely in {region['name']}. Skip irrigation on rainy days to conserve water and reduce fungal disease risk."
+            advice_tw  = f"Osu kakra reba wɔ {region['name_tw']}. Mma nsuo gu afuo so da a osu ba no."
             risk       = "Moderate moisture stress risk"
             risk_tw    = "Nsuo haw mfinimfini"
             risk_level = "warn"
         else:
-            advice     = "Dry conditions ahead. Irrigate crops well, especially young seedlings."
-            advice_tw  = "Awia bɛyɛ den. Ma nsuo gu wo aba so, titiriw mma nketewa no."
+            advice     = f"Dry conditions in {region['name']}. Irrigate crops well, especially young seedlings. Good time for field operations."
+            advice_tw  = f"Awia bɛyɛ den wɔ {region['name_tw']}. Ma nsuo gu wo aba so, titiriw mma nketewa no."
             risk       = "Low rainfall — monitor soil moisture"
             risk_tw    = "Osu ketewa — hwɛ asaase nsuo"
             risk_level = "ok"
 
         return {
-            "location":    "Accra Region, Ghana",
+            "location":    region["name"],
+            "location_tw": region["name_tw"],
             "today_high":  today_high,
             "humidity":    humidity,
             "rain_chance": today_rain,
@@ -166,7 +186,8 @@ def get_weather():
     except Exception as e:
         print(f"[Weather API error] {e}")
         return {
-            "location":    "Accra Region, Ghana",
+            "location":    region["name"],
+            "location_tw": region["name_tw"],
             "today_high":  34,
             "humidity":    78,
             "rain_chance": 60,
@@ -180,7 +201,7 @@ def get_weather():
                 {"day": "Sat", "icon": "☀️",  "high": 33, "rain": 15},
                 {"day": "Sun", "icon": "☀️",  "high": 34, "rain": 10},
             ],
-            "advice":      "Weather data temporarily unavailable.",
+            "advice":      "Weather data temporarily unavailable. Please check back shortly.",
             "advice_tw":   "Ɔhaw ho nsɛm nni hɔ seesei.",
             "risk":        "Data unavailable",
             "risk_tw":     "Nsɛm nni hɔ",
@@ -193,20 +214,20 @@ def get_weather():
 # Static data
 # ---------------------------------------------------------------------------
 PRICE_DATA = [
-    {"crop": "Maize",     "crop_tw": "Aburo",      "unit": "50kg bag",   "price": 240, "change": 8,   "trend": "up"},
-    {"crop": "Tomatoes",  "crop_tw": "Ntomato",    "unit": "crate",      "price": 180, "change": -12, "trend": "down"},
-    {"crop": "Cassava",   "crop_tw": "Bankye",     "unit": "100kg bag",  "price": 310, "change": 0,   "trend": "stable"},
-    {"crop": "Plantain",  "crop_tw": "Ɔgede",      "unit": "bunch",      "price": 55,  "change": 3,   "trend": "up"},
-    {"crop": "Yam",       "crop_tw": "Bayerɛ",     "unit": "tuber (lg)", "price": 35,  "change": 5,   "trend": "up"},
-    {"crop": "Cocoa",     "crop_tw": "Kookoo",     "unit": "kg dry bean","price": 24,  "change": 2,   "trend": "up"},
-    {"crop": "Pepper",    "crop_tw": "Mako",       "unit": "kg",         "price": 28,  "change": -5,  "trend": "down"},
-    {"crop": "Groundnut", "crop_tw": "Nkatie",     "unit": "50kg bag",   "price": 290, "change": 1,   "trend": "stable"},
+    {"crop": "Maize",     "crop_tw": "Aburo",   "unit": "50kg bag",    "price": 240, "change": 8,   "trend": "up"},
+    {"crop": "Tomatoes",  "crop_tw": "Ntomato", "unit": "crate",       "price": 180, "change": -12, "trend": "down"},
+    {"crop": "Cassava",   "crop_tw": "Bankye",  "unit": "100kg bag",   "price": 310, "change": 0,   "trend": "stable"},
+    {"crop": "Plantain",  "crop_tw": "Ɔgede",   "unit": "bunch",       "price": 55,  "change": 3,   "trend": "up"},
+    {"crop": "Yam",       "crop_tw": "Bayerɛ",  "unit": "tuber (lg)",  "price": 35,  "change": 5,   "trend": "up"},
+    {"crop": "Cocoa",     "crop_tw": "Kookoo",  "unit": "kg dry bean", "price": 24,  "change": 2,   "trend": "up"},
+    {"crop": "Pepper",    "crop_tw": "Mako",    "unit": "kg",          "price": 28,  "change": -5,  "trend": "down"},
+    {"crop": "Groundnut", "crop_tw": "Nkatie",  "unit": "50kg bag",    "price": 290, "change": 1,   "trend": "stable"},
 ]
 
 PEST_DATA = [
     {
-        "name": "Fall Armyworm", "name_tw": "Aburo Mmoa",
-        "crops": "Maize", "crops_tw": "Aburo",
+        "name": "Fall Armyworm",       "name_tw": "Aburo Mmoa",
+        "crops": "Maize",              "crops_tw": "Aburo",
         "description": "High risk season. Check leaves for feeding damage and egg masses.",
         "description_tw": "Ɔberɛ kɛseɛ. Hwɛ nkotokuo so sɛ mmoa adidi so anaa wɔada ɛfa so.",
         "level": "high",
@@ -215,7 +236,7 @@ PEST_DATA = [
     },
     {
         "name": "Cassava Leaf Blight", "name_tw": "Bankye Nkotokuo Yareɛ",
-        "crops": "Cassava", "crops_tw": "Bankye",
+        "crops": "Cassava",            "crops_tw": "Bankye",
         "description": "Humidity-driven fungal disease. Angular brown spots on leaves.",
         "description_tw": "Yareɛ a nsuo ɛma aba. Bankye nkotokuo so akyene borɔ aba.",
         "level": "medium",
@@ -223,8 +244,8 @@ PEST_DATA = [
         "tip_tw": "Yi nkotokuo a yareɛ wɔ so no. Ma mframa ntumi tra mu yie.",
     },
     {
-        "name": "Aphids", "name_tw": "Mmoa Ketewa",
-        "crops": "Vegetables", "crops_tw": "Atosɔde",
+        "name": "Aphids",              "name_tw": "Mmoa Ketewa",
+        "crops": "Vegetables",         "crops_tw": "Atosɔde",
         "description": "Low pressure this week. Monitor undersides of leaves.",
         "description_tw": "Ɔhaw ketewa wiemuhyɛn yi. Hwɛ nkotokuo ase.",
         "level": "low",
@@ -232,8 +253,8 @@ PEST_DATA = [
         "tip_tw": "De nsuo ne sapo mu ngu so anaa fa beetles a ɛdi wɔn.",
     },
     {
-        "name": "Cassava Mosaic Virus", "name_tw": "Bankye Yareɛ Kɛseɛ",
-        "crops": "Cassava", "crops_tw": "Bankye",
+        "name": "Cassava Mosaic Virus","name_tw": "Bankye Yareɛ Kɛseɛ",
+        "crops": "Cassava",            "crops_tw": "Bankye",
         "description": "Spread by whiteflies. Yellowing and distortion of leaves.",
         "description_tw": "Nsansanwa na ɛde ba. Nkotokuo sere na wɔsɛe.",
         "level": "medium",
@@ -260,7 +281,6 @@ QUICK_QUESTIONS_TW = [
     "Ɛdeɛn na mɛtumi de me aba sie akɔ akyiri sen saa?",
 ]
 
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -268,17 +288,21 @@ QUICK_QUESTIONS_TW = [
 def index():
     return render_template(
         "index.html",
-        weather=get_weather(),
+        weather=get_weather("greater_accra"),
         prices=PRICE_DATA,
         pests=PEST_DATA,
         quick_questions_en=QUICK_QUESTIONS_EN,
         quick_questions_tw=QUICK_QUESTIONS_TW,
+        regions=GHANA_REGIONS,
         api_ready=bool(client.api_key),
     )
 
 @app.route("/api/weather")
 def api_weather():
-    return jsonify(get_weather())
+    region_key = request.args.get("region", "greater_accra")
+    if region_key not in GHANA_REGIONS:
+        region_key = "greater_accra"
+    return jsonify(get_weather(region_key))
 
 @app.route("/api/prices")
 def api_prices():
@@ -288,17 +312,15 @@ def api_prices():
 def api_pests():
     return jsonify(PEST_DATA)
 
-
 @app.route("/api/diagnose", methods=["POST"])
 def api_diagnose():
-    """Analyse a crop photo for disease using Claude Vision."""
     if not client.api_key:
         return jsonify({"error": "ANTHROPIC_API_KEY not set."}), 500
 
-    data     = request.get_json()
-    image_b64 = data.get("image")
+    data       = request.get_json()
+    image_b64  = data.get("image")
     media_type = data.get("media_type", "image/jpeg")
-    lang     = data.get("lang", "en")
+    lang       = data.get("lang", "en")
 
     if not image_b64:
         return jsonify({"error": "No image provided"}), 400
@@ -309,25 +331,13 @@ def api_diagnose():
         with client.messages.stream(
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
+                    {"type": "text",  "text": prompt},
+                ],
+            }],
         ) as stream:
             for text in stream.text_stream:
                 yield f"data: {json.dumps({'text': text})}\n\n"
@@ -335,10 +345,8 @@ def api_diagnose():
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
-
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
-    """Streaming chat powered by Claude."""
     data     = request.get_json()
     messages = data.get("messages", [])
     lang     = data.get("lang", "en")
@@ -363,11 +371,9 @@ def api_chat():
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
-
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n🌿 FarmWise AI starting...")
     print("   API key set:", bool(client.api_key))
     print("   Open: http://localhost:5000\n")
     app.run(debug=True, port=5000)
-
