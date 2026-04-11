@@ -179,75 +179,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
       <button class="lang-btn active" onclick="setLang('en')">EN</button>
       <button class="lang-btn" onclick="setLang('tw')">TW</button>
     </div>
-    {% if user.plan == 'pro' %}
-      <span class="pro-pill">&#10003; Pro</span>
-    {% else %}
-      <button class="upgrade-pill" onclick="openUpgrade()">Upgrade to Pro</button>
-    {% endif %}
     <div class="api-status {% if api_ready %}api-ok{% else %}api-warn{% endif %}">
       {% if api_ready %}&#9679; AI ready{% else %}&#9888; No API key{% endif %}
     </div>
   </div>
 </div>
 
-<!-- Payment success banner -->
-{% if request.args.get('payment') == 'success' %}
-<div class="container" style="padding-bottom:0;">
-  <div class="pay-success">&#10003; Payment confirmed! You are now on Pro. Enjoy unlimited access.</div>
-</div>
-{% endif %}
 
-<!-- Upgrade modal -->
-<div class="modal-overlay" id="upgradeModal">
-  <div class="modal">
-    <button class="close-modal" onclick="closeUpgrade()">&#10005;</button>
-    <div class="modal-title">Upgrade to FarmWise Pro</div>
-    <div class="modal-sub">Get unlimited AI questions, photo diagnoses and more.</div>
-    <div class="plan-grid">
-      <div class="plan-card">
-        <div class="plan-name">Free</div>
-        <div class="plan-price">GHS 0</div>
-        <div class="plan-period">forever</div>
-        <div class="plan-feat">
-          <span class="chk">&#10003;</span> {{ free_limit }} questions/day<br>
-          <span class="chk">&#10003;</span> {{ diagnose_limit }} diagnoses/month<br>
-          <span class="crs">&#10005;</span> Unlimited chat<br>
-          <span class="crs">&#10005;</span> Price alerts
-        </div>
-      </div>
-      <div class="plan-card pro">
-        <div class="popular-pill">Most popular</div>
-        <div class="plan-name">Pro</div>
-        <div class="plan-price">GHS 30</div>
-        <div class="plan-period">per month</div>
-        <div class="plan-feat">
-          <span class="chk">&#10003;</span> Unlimited chat<br>
-          <span class="chk">&#10003;</span> Unlimited diagnoses<br>
-          <span class="chk">&#10003;</span> Price trend alerts<br>
-          <span class="chk">&#10003;</span> Priority support
-        </div>
-      </div>
-    </div>
-    <input type="email" class="email-input" id="payEmail" placeholder="Enter your email address"/>
-    <button class="pay-btn-main" onclick="startPayment()">Pay GHS 30 with MoMo or Card</button>
-    <div class="pay-note">&#128274; Secured by Paystack · Cancel anytime</div>
-  </div>
-</div>
 
 <div class="container">
 
-  <!-- Usage counter (free users only) -->
-  {% if user.plan != 'pro' %}
-  <div class="usage-bar" id="usageBar">
-    <span class="usage-label" data-en="Today's questions" data-tw="Nnɛ nsɛmmisa">Today's questions</span>
-    <div class="usage-track">
-      <div class="usage-fill {% if used_today >= free_limit %}full{% elif used_today >= free_limit - 1 %}warn{% else %}ok{% endif %}"
-           style="width:{{ [used_today / free_limit * 100, 100]|min|int }}%"></div>
-    </div>
-    <span class="usage-count" id="usageCount">{{ used_today }} / {{ free_limit }}</span>
-    <button class="upgrade-pill" onclick="openUpgrade()" data-en="Upgrade" data-tw="Sesa">Upgrade</button>
-  </div>
-  {% endif %}
+
 
   <!-- Tabs -->
   <div class="tabs">
@@ -596,13 +538,7 @@ async function sendMessage() {
 
     if (!resp.ok) {
       const err = await resp.json();
-      if (err.error === 'limit_reached') {
-        aiDiv.textContent = currentLang === 'tw' ? (err.message_tw || err.message) : err.message;
-        updateUsageBar(FREE_LIMIT);
-        setTimeout(openUpgrade, 1500);
-      } else {
-        aiDiv.textContent = '⚠ ' + (err.error || 'Error');
-      }
+      aiDiv.textContent = '⚠ ' + (err.error || 'Error');
       sendBtn.disabled = false;
       return;
     }
@@ -628,7 +564,6 @@ async function sendMessage() {
       }
     }
     conversationHistory.push({ role: 'assistant', content: fullText });
-    if (USER_PLAN !== 'pro') updateUsageBar(usedToday + 1);
   } catch(e) {
     aiDiv.textContent = '⚠ Connection error. Please try again.';
   }
@@ -637,53 +572,7 @@ async function sendMessage() {
   chatInput.focus();
 }
 
-// ---------------------------------------------------------------------------
-// Usage & upgrade
-// ---------------------------------------------------------------------------
-const USER_PLAN   = '{{ user.plan }}';
-const FREE_LIMIT  = {{ free_limit }};
-let usedToday     = {{ used_today }};
 
-function openUpgrade()  { document.getElementById('upgradeModal').classList.add('open'); }
-function closeUpgrade() { document.getElementById('upgradeModal').classList.remove('open'); }
-
-async function startPayment() {
-  const email = document.getElementById('payEmail').value.trim();
-  if (!email || !email.includes('@')) {
-    alert('Please enter a valid email address.');
-    return;
-  }
-  const btn = document.querySelector('.pay-btn-main');
-  btn.disabled = true; btn.textContent = 'Loading...';
-  try {
-    const resp = await fetch('/api/pay/init', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({email})
-    });
-    const data = await resp.json();
-    if (data.authorization_url) {
-      window.location.href = data.authorization_url;
-    } else {
-      alert(data.error || 'Payment failed. Please try again.');
-      btn.disabled = false; btn.textContent = 'Pay GHS 30 with MoMo or Card';
-    }
-  } catch(e) {
-    alert('Connection error. Please try again.');
-    btn.disabled = false; btn.textContent = 'Pay GHS 30 with MoMo or Card';
-  }
-}
-
-function updateUsageBar(used) {
-  usedToday = used;
-  const el = document.getElementById('usageCount');
-  if (el) el.textContent = used + ' / ' + FREE_LIMIT;
-  const fill = document.querySelector('.usage-fill');
-  if (fill) {
-    const pct = Math.min(used/FREE_LIMIT*100,100);
-    fill.style.width = pct + '%';
-    fill.className = 'usage-fill ' + (used>=FREE_LIMIT?'full':(used>=FREE_LIMIT-1?'warn':'ok'));
-  }
-}
 let selectedImageB64  = null;
 let selectedMediaType = 'image/jpeg';
 
