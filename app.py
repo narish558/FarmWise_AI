@@ -1,379 +1,528 @@
 """
-FarmWise AI - Farmer Assistant Tool
-Powered by Anthropic Claude API + Open-Meteo (live weather)
-Features: Live weather for all Ghana regions, AI chat, Photo disease diagnosis, Twi language support
+FarmWise AI - Complete App
+Features:
+  - Live weather for all 16 Ghana regions
+  - AI chat (Claude) in English and Twi
+  - Photo disease diagnosis
+  - Usage limits (5 questions/day free, unlimited Pro)
+  - Paystack payment integration (GHS 30/month)
+  - Admin dashboard
 
-Run:
-    pip install flask anthropic requests gunicorn
-    export ANTHROPIC_API_KEY=sk-ant-your-key-here
-    python app.py
-
-Then open: http://localhost:5000
+Environment variables needed on Render:
+  ANTHROPIC_API_KEY   - your Anthropic key
+  PAYSTACK_SECRET_KEY - from paystack.com dashboard
+  ADMIN_PASSWORD      - password to access /admin
 """
 
-import os
-import json
-import requests
-import anthropic
-from flask import Flask, render_template, request, jsonify, stream_with_context, Response
+import os, json, sqlite3, hashlib, requests, anthropic
+from datetime import datetime, date
+from flask import (Flask, render_template, request,
+                   jsonify, stream_with_context, Response, session, redirect)
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "farmwise-secret-2024")
 
 # ---------------------------------------------------------------------------
-# Anthropic client
+# Clients
 # ---------------------------------------------------------------------------
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+PAYSTACK_SECRET = os.environ.get("PAYSTACK_SECRET_KEY", "")
+ADMIN_PASSWORD  = os.environ.get("ADMIN_PASSWORD", "farmwise2024")
 
-SYSTEM_PROMPT_EN = """You are FarmWise AI, a knowledgeable and friendly farming assistant focused on 
-helping smallholder farmers in Ghana and West Africa. You help with:
+FREE_DAILY_LIMIT     = 5
+FREE_DIAGNOSE_LIMIT  = 3   # per month
 
-1. WEATHER & IRRIGATION - interpreting weather patterns, advising on irrigation timing, 
-   planting windows, and climate risks for local crops.
-2. MARKET PRICES - advising on when to buy inputs, when to sell harvests, price trends 
-   for maize, cassava, tomatoes, plantain, yam, cocoa, and other Ghanaian crops.
-3. PEST & DISEASE MANAGEMENT - identifying symptoms, recommending affordable local 
-   treatments, and preventive practices for common pests like Fall Armyworm, aphids, 
-   leaf blight, and cassava mosaic virus.
-4. CROP PLANNING - which crops suit the season, soil type, rainfall; rotation advice.
+# ---------------------------------------------------------------------------
+# Database setup (SQLite — zero config, works on Render free tier)
+# ---------------------------------------------------------------------------
+DB_PATH = "/tmp/farmwise.db"   # /tmp persists during a session on Render
 
-Always give practical, affordable advice suited to smallholder farming with limited resources.
-Be concise, clear, and warm. Use simple language. When relevant, mention local crop names 
-and local markets (Kumasi, Accra, Tamale). If a question is outside farming, gently redirect 
-back to farming topics.
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as db:
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id    TEXT UNIQUE NOT NULL,
+            phone         TEXT,
+            email         TEXT,
+            plan          TEXT DEFAULT 'free',
+            region        TEXT DEFAULT 'greater_accra',
+            lang          TEXT DEFAULT 'en',
+            created_at    TEXT DEFAULT (datetime('now')),
+            pro_since     TEXT,
+            paystack_ref  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS usage (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id    TEXT NOT NULL,
+            type          TEXT NOT NULL,
+            question      TEXT,
+            created_at    TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS payments (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id    TEXT NOT NULL,
+            reference     TEXT UNIQUE NOT NULL,
+            amount        INTEGER,
+            status        TEXT DEFAULT 'pending',
+            created_at    TEXT DEFAULT (datetime('now'))
+        );
+        """)
+
+init_db()
+
+# ---------------------------------------------------------------------------
+# Session helpers
+# ---------------------------------------------------------------------------
+def get_session_id():
+    if "sid" not in session:
+        import uuid
+        session["sid"] = str(uuid.uuid4())
+    return session["sid"]
+
+def get_or_create_user(sid):
+    with get_db() as db:
+        user = db.execute("SELECT * FROM users WHERE session_id=?", (sid,)).fetchone()
+        if not user:
+            db.execute("INSERT INTO users (session_id) VALUES (?)", (sid,))
+            db.commit()
+            user = db.execute("SELECT * FROM users WHERE session_id=?", (sid,)).fetchone()
+    return dict(user)
+
+def get_usage_today(sid):
+    with get_db() as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM usage WHERE session_id=? AND type='chat' AND date(created_at)=date('now')",
+            (sid,)
+        ).fetchone()[0]
+    return count
+
+def get_diagnose_this_month(sid):
+    with get_db() as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM usage WHERE session_id=? AND type='diagnose' AND strftime('%Y-%m',created_at)=strftime('%Y-%m','now')",
+            (sid,)
+        ).fetchone()[0]
+    return count
+
+def log_usage(sid, type_, question=None):
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO usage (session_id, type, question) VALUES (?,?,?)",
+            (sid, type_, question[:300] if question else None)
+        )
+        db.commit()
+
+def is_pro(user):
+    return user.get("plan") == "pro"
+
+# ---------------------------------------------------------------------------
+# AI prompts
+# ---------------------------------------------------------------------------
+SYSTEM_EN = """You are FarmWise AI, a knowledgeable and friendly farming assistant for 
+smallholder farmers in Ghana and West Africa. Help with:
+1. WEATHER & IRRIGATION - planting windows, irrigation timing, climate risks
+2. MARKET PRICES - when to buy inputs, when to sell, price trends for Ghanaian crops
+3. PEST & DISEASE - identify symptoms, recommend affordable local treatments
+4. CROP PLANNING - which crops suit the season, soil, rainfall; rotation advice
+
+Give practical, affordable advice. Be concise, warm, use simple language.
+Mention local crop names and markets (Kumasi, Accra, Tamale) when relevant.
+Keep replies under 200 words for WhatsApp compatibility.
 """
 
-SYSTEM_PROMPT_TW = """Wo yɛ FarmWise AI, obi a ɔnim adwuma ho asɛm na ɔboa nnomkuo afuom adwumayɛfoɔ 
-wɔ Ghana ne Atɔeɛ Afrika mu. Woboa wɔn ho asɛm a ɛfa:
-
-1. ƆHAW NE NSUO HOHOROW - kyerɛ osu ho asɛm, ka wɔn ho asɛm faako wɔn hwehwɛ nsuo, 
-   ɛberɛ a ɛsɛ sɛ wɔdua aba, ne ɔhaw a osu bɛma wɔn afuo mu aba.
-2. AGUADI TENTEENE - ka wɔn ho asɛm faako wɔn tɔ adwuma ho gɔdo, ɛberɛ a ɛsɛ sɛ wɔtɔn 
-   wɔn aba, ne wuramu tenteene.
-3. MMOA YAREƐ NHYEHYƐE - kyerɛ nsɛnkyerɛnne, ka wɔn ho asɛm faako aduro.
-4. DUA ABA NHYEHYƐE - afuo aba bɛn na ɛfata ɔberɛ no, asaase no, ne osu no.
-
-Fa asɛm a ɛho hia, a wɔbɛtumi ayɛ, na ɛka nnomkuo nkuraasefoɔ afuom adwumayɛfoɔ ho.
-Ka asɛm no ntɛm, dwoodwoo, na sɔ wɔn da.
+SYSTEM_TW = """Wo yɛ FarmWise AI, obi a ɔnim adwuma ho asɛm na ɔboa nnomkuo afuom adwumayɛfoɔ 
+wɔ Ghana ne Atɔeɛ Afrika mu. Woboa wɔn ho asɛm a ɛfa ɔhaw, aguadi, mmoa ne aba dua.
+Ka asɛm no ntɛm, dwoodwoo, na sɔ wɔn da. Fa kasa a ɛyɛ mmerɛw.
 """
 
-DISEASE_PROMPT_EN = """You are an expert plant pathologist for Ghana and West Africa crops.
+DISEASE_EN = """You are an expert plant pathologist for Ghana/West Africa crops.
 Analyze this crop photo and provide:
-
-1. DISEASE/PEST NAME - what you see affecting the crop
-2. CROP AFFECTED - identify the crop if visible
+1. DISEASE/PEST NAME
+2. CROP AFFECTED
 3. SEVERITY - Low / Medium / High
-4. SYMPTOMS - what visible signs you can see in the image
-5. TREATMENT - affordable, practical treatment steps available to smallholder farmers in Ghana
-6. PREVENTION - how to prevent this in future
-
-Be specific, practical, and mention locally available products where possible.
-If the image is not a crop or plant, politely say so and ask for a crop photo.
-Format your response clearly with these headings.
+4. SYMPTOMS visible in the image
+5. TREATMENT - affordable steps for Ghana smallholder farmers
+6. PREVENTION for the future
+Be specific. Mention locally available products. Format with these headings.
+If not a crop photo, say so politely.
 """
 
-DISEASE_PROMPT_TW = """Wo yɛ ogya a ɔnim aba yareɛ wɔ Ghana ne Atɔeɛ Afrika afuo mu.
-Hwɛ saa afuo foto yi na ka:
-
-1. YAREƐ/MMOA DIN - deɛ wohunu a ɛreyɛ aba no yaw
-2. ABA A ƐWƆ SO - hunu aba no sɛ wohunu no
-3. YAREƐ TENTEN - Ketewa / Mfinimfini / Kɛseɛ
-4. NSƐNKYERƐNNE - nsɛnkyerɛnne a wohunu wɔ foto no mu
-5. ADURO - aduro a ɛyɛ mmerɛw
-6. BANBƆ - ɛdeɛn na wɔbɛtumi ayɛ sɛ eyi ammɛba bio
+DISEASE_TW = """Wo yɛ ogya a ɔnim aba yareɛ wɔ Ghana afuo mu.
+Hwɛ saa foto yi na ka: yareɛ din, aba a ɛwɔ so, yareɛ tenten, nsɛnkyerɛnne, aduro, ne banbɔ.
 """
 
 # ---------------------------------------------------------------------------
-# Ghana regions with coordinates
+# Ghana regions
 # ---------------------------------------------------------------------------
 GHANA_REGIONS = {
-    "greater_accra":  {"name": "Greater Accra (Accra)",      "name_tw": "Accra Kuro",           "lat": 5.55,  "lon": -0.20},
-    "ashanti":        {"name": "Ashanti (Kumasi)",            "name_tw": "Ashanti (Kumasi)",      "lat": 6.69,  "lon": -1.62},
-    "northern":       {"name": "Northern (Tamale)",           "name_tw": "Atifi (Tamale)",        "lat": 9.40,  "lon": -0.85},
-    "central":        {"name": "Central (Cape Coast)",        "name_tw": "Mfinimfini (Cape Coast)","lat": 5.10, "lon": -1.25},
-    "bono":           {"name": "Bono (Sunyani)",              "name_tw": "Bono (Sunyani)",        "lat": 7.33,  "lon": -2.33},
-    "eastern":        {"name": "Eastern (Koforidua)",         "name_tw": "Apuei (Koforidua)",     "lat": 6.09,  "lon": -0.26},
-    "volta":          {"name": "Volta (Ho)",                  "name_tw": "Volta (Ho)",            "lat": 6.60,  "lon":  0.47},
-    "upper_west":     {"name": "Upper West (Wa)",             "name_tw": "Atifi Atɔeɛ (Wa)",     "lat": 10.06, "lon": -2.50},
-    "upper_east":     {"name": "Upper East (Bolgatanga)",     "name_tw": "Atifi Apuei (Bolgatanga)","lat": 10.79,"lon": -0.85},
-    "western":        {"name": "Western (Takoradi)",          "name_tw": "Atɔeɛ (Takoradi)",     "lat": 4.90,  "lon": -1.76},
-    "oti":            {"name": "Oti (Dambai)",                "name_tw": "Oti (Dambai)",          "lat": 7.97,  "lon":  0.18},
-    "bono_east":      {"name": "Bono East (Techiman)",        "name_tw": "Bono Apuei (Techiman)", "lat": 7.59,  "lon": -1.94},
-    "ahafo":          {"name": "Ahafo (Goaso)",               "name_tw": "Ahafo (Goaso)",         "lat": 6.80,  "lon": -2.52},
-    "western_north":  {"name": "Western North (Sefwi Wiawso)","name_tw": "Atɔeɛ Atifi (Sefwi)",  "lat": 6.20,  "lon": -2.47},
-    "north_east":     {"name": "North East (Nalerigu)",       "name_tw": "Atifi Apuei Foforɔ (Nalerigu)","lat": 10.52,"lon": -0.36},
-    "savannah":       {"name": "Savannah (Damongo)",          "name_tw": "Savannah (Damongo)",    "lat": 9.08,  "lon": -1.82},
+    "greater_accra": {"name":"Greater Accra (Accra)",       "name_tw":"Accra Kuro",            "lat":5.55,  "lon":-0.20},
+    "ashanti":       {"name":"Ashanti (Kumasi)",             "name_tw":"Ashanti (Kumasi)",       "lat":6.69,  "lon":-1.62},
+    "northern":      {"name":"Northern (Tamale)",            "name_tw":"Atifi (Tamale)",         "lat":9.40,  "lon":-0.85},
+    "central":       {"name":"Central (Cape Coast)",         "name_tw":"Mfinimfini (Cape Coast)","lat":5.10,  "lon":-1.25},
+    "bono":          {"name":"Bono (Sunyani)",               "name_tw":"Bono (Sunyani)",         "lat":7.33,  "lon":-2.33},
+    "eastern":       {"name":"Eastern (Koforidua)",          "name_tw":"Apuei (Koforidua)",      "lat":6.09,  "lon":-0.26},
+    "volta":         {"name":"Volta (Ho)",                   "name_tw":"Volta (Ho)",             "lat":6.60,  "lon": 0.47},
+    "upper_west":    {"name":"Upper West (Wa)",              "name_tw":"Atifi Atɔeɛ (Wa)",      "lat":10.06, "lon":-2.50},
+    "upper_east":    {"name":"Upper East (Bolgatanga)",      "name_tw":"Atifi Apuei (Bolgatanga)","lat":10.79,"lon":-0.85},
+    "western":       {"name":"Western (Takoradi)",           "name_tw":"Atɔeɛ (Takoradi)",      "lat":4.90,  "lon":-1.76},
+    "oti":           {"name":"Oti (Dambai)",                 "name_tw":"Oti (Dambai)",           "lat":7.97,  "lon": 0.18},
+    "bono_east":     {"name":"Bono East (Techiman)",         "name_tw":"Bono Apuei (Techiman)",  "lat":7.59,  "lon":-1.94},
+    "ahafo":         {"name":"Ahafo (Goaso)",                "name_tw":"Ahafo (Goaso)",          "lat":6.80,  "lon":-2.52},
+    "western_north": {"name":"Western North (Sefwi Wiawso)", "name_tw":"Atɔeɛ Atifi (Sefwi)",   "lat":6.20,  "lon":-2.47},
+    "north_east":    {"name":"North East (Nalerigu)",        "name_tw":"Atifi Apuei (Nalerigu)", "lat":10.52, "lon":-0.36},
+    "savannah":      {"name":"Savannah (Damongo)",           "name_tw":"Savannah (Damongo)",     "lat":9.08,  "lon":-1.82},
 }
 
 # ---------------------------------------------------------------------------
-# Live weather from Open-Meteo — supports any Ghana region
+# Live weather
 # ---------------------------------------------------------------------------
 def get_weather(region_key="greater_accra"):
     region = GHANA_REGIONS.get(region_key, GHANA_REGIONS["greater_accra"])
-    lat    = region["lat"]
-    lon    = region["lon"]
-
     try:
         url = (
             f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lon}"
+            f"?latitude={region['lat']}&longitude={region['lon']}"
             f"&daily=temperature_2m_max,precipitation_probability_max,windspeed_10m_max"
-            f"&hourly=relativehumidity_2m"
-            f"&forecast_days=7"
-            f"&timezone=Africa%2FAccra"
+            f"&hourly=relativehumidity_2m&forecast_days=7&timezone=Africa%2FAccra"
         )
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-
-        daily     = data["daily"]
-        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-
-        def rain_icon(pct):
-            if pct < 30:   return "☀️"
-            elif pct < 60: return "⛅"
-            else:          return "🌧️"
-
-        forecast = [
-            {
-                "day":  day_names[i % 7],
-                "icon": rain_icon(daily["precipitation_probability_max"][i]),
-                "high": round(daily["temperature_2m_max"][i]),
-                "rain": daily["precipitation_probability_max"][i],
-            }
-            for i in range(min(7, len(daily["temperature_2m_max"])))
-        ]
-
-        today_rain = daily["precipitation_probability_max"][0]
-        today_high = round(daily["temperature_2m_max"][0])
-        today_wind = round(daily["windspeed_10m_max"][0])
-        humidity   = data["hourly"]["relativehumidity_2m"][12]
-
-        if today_rain >= 70:
-            advice     = f"Heavy rain expected in {region['name']}. Avoid spraying pesticides today. Check field drainage to prevent waterlogging."
-            advice_tw  = f"Osu kɛseɛ reba wɔ {region['name_tw']}. Mma aduro gu afuo so nnɛ. Hwɛ sɛ nsuo bɛtumi afi afuo no mu."
-            risk       = "High flood / waterlogging risk"
-            risk_tw    = "Osu kɛseɛ tumi de ɔhaw ba"
-            risk_level = "danger"
-        elif today_rain >= 40:
-            advice     = f"Moderate rain likely in {region['name']}. Skip irrigation on rainy days to conserve water and reduce fungal disease risk."
-            advice_tw  = f"Osu kakra reba wɔ {region['name_tw']}. Mma nsuo gu afuo so da a osu ba no."
-            risk       = "Moderate moisture stress risk"
-            risk_tw    = "Nsuo haw mfinimfini"
-            risk_level = "warn"
+        r = requests.get(url, timeout=10); r.raise_for_status()
+        d = r.json()["daily"]
+        day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+        icon = lambda p: "☀️" if p<30 else ("⛅" if p<60 else "🌧️")
+        forecast = [{"day":day_names[i%7],"icon":icon(d["precipitation_probability_max"][i]),
+                     "high":round(d["temperature_2m_max"][i]),"rain":d["precipitation_probability_max"][i]}
+                    for i in range(min(7,len(d["temperature_2m_max"])))]
+        rain = d["precipitation_probability_max"][0]
+        if rain>=70:
+            adv="Heavy rain expected. Avoid spraying pesticides. Check field drainage."; adv_tw="Osu kɛseɛ reba. Mma aduro gu afuo so."; risk="High flood risk"; risk_tw="Osu kɛseɛ tumi de ɔhaw ba"; rl="danger"
+        elif rain>=40:
+            adv="Moderate rain likely. Skip irrigation on rainy days."; adv_tw="Osu kakra reba. Mma nsuo gu afuo so da a osu ba."; risk="Moderate moisture risk"; risk_tw="Nsuo haw mfinimfini"; rl="warn"
         else:
-            advice     = f"Dry conditions in {region['name']}. Irrigate crops well, especially young seedlings. Good time for field operations."
-            advice_tw  = f"Awia bɛyɛ den wɔ {region['name_tw']}. Ma nsuo gu wo aba so, titiriw mma nketewa no."
-            risk       = "Low rainfall — monitor soil moisture"
-            risk_tw    = "Osu ketewa — hwɛ asaase nsuo"
-            risk_level = "ok"
-
-        return {
-            "location":    region["name"],
-            "location_tw": region["name_tw"],
-            "today_high":  today_high,
-            "humidity":    humidity,
-            "rain_chance": today_rain,
-            "wind_kmh":    today_wind,
-            "forecast":    forecast,
-            "advice":      advice,
-            "advice_tw":   advice_tw,
-            "risk":        risk,
-            "risk_tw":     risk_tw,
-            "risk_level":  risk_level,
-            "live":        True,
-        }
-
+            adv="Dry conditions. Irrigate crops well, especially seedlings."; adv_tw="Awia bɛyɛ den. Ma nsuo gu wo aba so."; risk="Low rainfall — monitor moisture"; risk_tw="Osu ketewa — hwɛ asaase nsuo"; rl="ok"
+        return {"location":region["name"],"location_tw":region["name_tw"],
+                "today_high":round(d["temperature_2m_max"][0]),"humidity":r.json()["hourly"]["relativehumidity_2m"][12],
+                "rain_chance":rain,"wind_kmh":round(d["windspeed_10m_max"][0]),
+                "forecast":forecast,"advice":adv,"advice_tw":adv_tw,"risk":risk,"risk_tw":risk_tw,"risk_level":rl,"live":True}
     except Exception as e:
-        print(f"[Weather API error] {e}")
-        return {
-            "location":    region["name"],
-            "location_tw": region["name_tw"],
-            "today_high":  34,
-            "humidity":    78,
-            "rain_chance": 60,
-            "wind_kmh":    14,
-            "forecast": [
-                {"day": "Mon", "icon": "☀️",  "high": 34, "rain": 10},
-                {"day": "Tue", "icon": "⛅",  "high": 33, "rain": 30},
-                {"day": "Wed", "icon": "🌧️", "high": 29, "rain": 75},
-                {"day": "Thu", "icon": "🌧️", "high": 28, "rain": 80},
-                {"day": "Fri", "icon": "⛅",  "high": 31, "rain": 40},
-                {"day": "Sat", "icon": "☀️",  "high": 33, "rain": 15},
-                {"day": "Sun", "icon": "☀️",  "high": 34, "rain": 10},
-            ],
-            "advice":      "Weather data temporarily unavailable. Please check back shortly.",
-            "advice_tw":   "Ɔhaw ho nsɛm nni hɔ seesei.",
-            "risk":        "Data unavailable",
-            "risk_tw":     "Nsɛm nni hɔ",
-            "risk_level":  "warn",
-            "live":        False,
-        }
-
+        print(f"[Weather error] {e}")
+        return {"location":region["name"],"location_tw":region["name_tw"],"today_high":34,"humidity":78,
+                "rain_chance":60,"wind_kmh":14,"forecast":[
+                    {"day":"Mon","icon":"☀️","high":34,"rain":10},{"day":"Tue","icon":"⛅","high":33,"rain":30},
+                    {"day":"Wed","icon":"🌧️","high":29,"rain":75},{"day":"Thu","icon":"🌧️","high":28,"rain":80},
+                    {"day":"Fri","icon":"⛅","high":31,"rain":40},{"day":"Sat","icon":"☀️","high":33,"rain":15},
+                    {"day":"Sun","icon":"☀️","high":34,"rain":10}],
+                "advice":"Weather data temporarily unavailable.","advice_tw":"Ɔhaw ho nsɛm nni hɔ.",
+                "risk":"Data unavailable","risk_tw":"Nsɛm nni hɔ","risk_level":"warn","live":False}
 
 # ---------------------------------------------------------------------------
 # Static data
 # ---------------------------------------------------------------------------
 PRICE_DATA = [
-    {"crop": "Maize",     "crop_tw": "Aburo",   "unit": "50kg bag",    "price": 240, "change": 8,   "trend": "up"},
-    {"crop": "Tomatoes",  "crop_tw": "Ntomato", "unit": "crate",       "price": 180, "change": -12, "trend": "down"},
-    {"crop": "Cassava",   "crop_tw": "Bankye",  "unit": "100kg bag",   "price": 310, "change": 0,   "trend": "stable"},
-    {"crop": "Plantain",  "crop_tw": "Ɔgede",   "unit": "bunch",       "price": 55,  "change": 3,   "trend": "up"},
-    {"crop": "Yam",       "crop_tw": "Bayerɛ",  "unit": "tuber (lg)",  "price": 35,  "change": 5,   "trend": "up"},
-    {"crop": "Cocoa",     "crop_tw": "Kookoo",  "unit": "kg dry bean", "price": 24,  "change": 2,   "trend": "up"},
-    {"crop": "Pepper",    "crop_tw": "Mako",    "unit": "kg",          "price": 28,  "change": -5,  "trend": "down"},
-    {"crop": "Groundnut", "crop_tw": "Nkatie",  "unit": "50kg bag",    "price": 290, "change": 1,   "trend": "stable"},
+    {"crop":"Maize",    "crop_tw":"Aburo",   "unit":"50kg bag",   "price":240,"change":8,  "trend":"up"},
+    {"crop":"Tomatoes", "crop_tw":"Ntomato", "unit":"crate",      "price":180,"change":-12,"trend":"down"},
+    {"crop":"Cassava",  "crop_tw":"Bankye",  "unit":"100kg bag",  "price":310,"change":0,  "trend":"stable"},
+    {"crop":"Plantain", "crop_tw":"Ɔgede",   "unit":"bunch",      "price":55, "change":3,  "trend":"up"},
+    {"crop":"Yam",      "crop_tw":"Bayerɛ",  "unit":"tuber (lg)", "price":35, "change":5,  "trend":"up"},
+    {"crop":"Cocoa",    "crop_tw":"Kookoo",  "unit":"kg dry bean","price":24, "change":2,  "trend":"up"},
+    {"crop":"Pepper",   "crop_tw":"Mako",    "unit":"kg",         "price":28, "change":-5, "trend":"down"},
+    {"crop":"Groundnut","crop_tw":"Nkatie",  "unit":"50kg bag",   "price":290,"change":1,  "trend":"stable"},
 ]
-
 PEST_DATA = [
-    {
-        "name": "Fall Armyworm",       "name_tw": "Aburo Mmoa",
-        "crops": "Maize",              "crops_tw": "Aburo",
-        "description": "High risk season. Check leaves for feeding damage and egg masses.",
-        "description_tw": "Ɔberɛ kɛseɛ. Hwɛ nkotokuo so sɛ mmoa adidi so anaa wɔada ɛfa so.",
-        "level": "high",
-        "tip": "Apply neem-based spray early morning. Report sightings to extension officer.",
-        "tip_tw": "De neem aduro gu so anɔpa. Ka kyerɛ wo agyinafoɔ sɛ wohunu no.",
-    },
-    {
-        "name": "Cassava Leaf Blight", "name_tw": "Bankye Nkotokuo Yareɛ",
-        "crops": "Cassava",            "crops_tw": "Bankye",
-        "description": "Humidity-driven fungal disease. Angular brown spots on leaves.",
-        "description_tw": "Yareɛ a nsuo ɛma aba. Bankye nkotokuo so akyene borɔ aba.",
-        "level": "medium",
-        "tip": "Remove infected leaves. Improve airflow by spacing plants well.",
-        "tip_tw": "Yi nkotokuo a yareɛ wɔ so no. Ma mframa ntumi tra mu yie.",
-    },
-    {
-        "name": "Aphids",              "name_tw": "Mmoa Ketewa",
-        "crops": "Vegetables",         "crops_tw": "Atosɔde",
-        "description": "Low pressure this week. Monitor undersides of leaves.",
-        "description_tw": "Ɔhaw ketewa wiemuhyɛn yi. Hwɛ nkotokuo ase.",
-        "level": "low",
-        "tip": "Spray with diluted soapy water or introduce ladybird beetles.",
-        "tip_tw": "De nsuo ne sapo mu ngu so anaa fa beetles a ɛdi wɔn.",
-    },
-    {
-        "name": "Cassava Mosaic Virus","name_tw": "Bankye Yareɛ Kɛseɛ",
-        "crops": "Cassava",            "crops_tw": "Bankye",
-        "description": "Spread by whiteflies. Yellowing and distortion of leaves.",
-        "description_tw": "Nsansanwa na ɛde ba. Nkotokuo sere na wɔsɛe.",
-        "level": "medium",
-        "tip": "Use certified disease-free planting material. Control whitefly populations.",
-        "tip_tw": "Fa bankye a yareɛ nni so. Tia nsansanwa a ɛwɔ hɔ.",
-    },
+    {"name":"Fall Armyworm","name_tw":"Aburo Mmoa","crops":"Maize","crops_tw":"Aburo",
+     "description":"High risk season. Check leaves for feeding damage and egg masses.",
+     "description_tw":"Ɔberɛ kɛseɛ. Hwɛ nkotokuo so sɛ mmoa adidi so.",
+     "level":"high","tip":"Apply neem-based spray early morning.","tip_tw":"De neem aduro gu so anɔpa."},
+    {"name":"Cassava Leaf Blight","name_tw":"Bankye Nkotokuo Yareɛ","crops":"Cassava","crops_tw":"Bankye",
+     "description":"Humidity-driven fungal disease. Angular brown spots on leaves.",
+     "description_tw":"Yareɛ a nsuo ɛma aba. Bankye nkotokuo so akyene borɔ aba.",
+     "level":"medium","tip":"Remove infected leaves. Space plants for airflow.","tip_tw":"Yi nkotokuo a yareɛ wɔ so no."},
+    {"name":"Aphids","name_tw":"Mmoa Ketewa","crops":"Vegetables","crops_tw":"Atosɔde",
+     "description":"Low pressure this week. Monitor undersides of leaves.",
+     "description_tw":"Ɔhaw ketewa. Hwɛ nkotokuo ase.",
+     "level":"low","tip":"Spray with diluted soapy water.","tip_tw":"De nsuo ne sapo mu ngu so."},
+    {"name":"Cassava Mosaic Virus","name_tw":"Bankye Yareɛ Kɛseɛ","crops":"Cassava","crops_tw":"Bankye",
+     "description":"Spread by whiteflies. Yellowing and distortion of leaves.",
+     "description_tw":"Nsansanwa na ɛde ba. Nkotokuo sere na wɔsɛe.",
+     "level":"medium","tip":"Use certified disease-free planting material.","tip_tw":"Fa bankye a yareɛ nni so."},
 ]
-
-QUICK_QUESTIONS_EN = [
-    "What crop should I plant in Ghana during the minor rainy season?",
-    "How do I treat Fall Armyworm on my maize crop with local methods?",
-    "When is the best time to sell my tomatoes to get the best price?",
-    "How do I know if my soil is ready for planting?",
-    "What fertilizer should I use for maize farming in Ghana?",
-    "How can I store my harvest longer without refrigeration?",
-]
-
-QUICK_QUESTIONS_TW = [
-    "Aba bɛn na mɛdua wɔ Ghana wɔ osu ketewa ɔberɛ?",
-    "Ɛdeɛn na mɛyɛ aburo mmoa ho wɔ me aburo afuo so?",
-    "Ɛberɛ bɛn na ɛsɛ sɛ metɔn me ntomato na menya wuramu pa?",
-    "Ɛdeɛn na mɛhunu sɛ me asaase atoto adua?",
-    "Aduro bɛn na mɛfa ama aburo adwuma wɔ Ghana?",
-    "Ɛdeɛn na mɛtumi de me aba sie akɔ akyiri sen saa?",
-]
+QUICK_EN = ["What crop should I plant in Ghana during the minor rainy season?",
+            "How do I treat Fall Armyworm on my maize crop with local methods?",
+            "When is the best time to sell my tomatoes to get the best price?",
+            "How do I know if my soil is ready for planting?",
+            "What fertilizer should I use for maize farming in Ghana?",
+            "How can I store my harvest longer without refrigeration?"]
+QUICK_TW = ["Aba bɛn na mɛdua wɔ Ghana wɔ osu ketewa ɔberɛ?",
+            "Ɛdeɛn na mɛyɛ aburo mmoa ho wɔ me aburo afuo so?",
+            "Ɛberɛ bɛn na ɛsɛ sɛ metɔn me ntomato na menya wuramu pa?",
+            "Ɛdeɛn na mɛhunu sɛ me asaase atoto adua?",
+            "Aduro bɛn na mɛfa ama aburo adwuma wɔ Ghana?",
+            "Ɛdeɛn na mɛtumi de me aba sie akɔ akyiri sen saa?"]
 
 # ---------------------------------------------------------------------------
-# Routes
+# Main route
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return render_template(
-        "index.html",
-        weather=get_weather("greater_accra"),
-        prices=PRICE_DATA,
-        pests=PEST_DATA,
-        quick_questions_en=QUICK_QUESTIONS_EN,
-        quick_questions_tw=QUICK_QUESTIONS_TW,
+    sid  = get_session_id()
+    user = get_or_create_user(sid)
+    used_today    = get_usage_today(sid)
+    used_diagnose = get_diagnose_this_month(sid)
+    return render_template("index.html",
+        weather=get_weather(user.get("region","greater_accra")),
+        prices=PRICE_DATA, pests=PEST_DATA,
+        quick_en=QUICK_EN, quick_tw=QUICK_TW,
         regions=GHANA_REGIONS,
+        user=user,
+        used_today=used_today,
+        used_diagnose=used_diagnose,
+        free_limit=FREE_DAILY_LIMIT,
+        diagnose_limit=FREE_DIAGNOSE_LIMIT,
         api_ready=bool(client.api_key),
+        paystack_public=os.environ.get("PAYSTACK_PUBLIC_KEY",""),
     )
 
+# ---------------------------------------------------------------------------
+# Weather API
+# ---------------------------------------------------------------------------
 @app.route("/api/weather")
 def api_weather():
-    region_key = request.args.get("region", "greater_accra")
-    if region_key not in GHANA_REGIONS:
-        region_key = "greater_accra"
+    region_key = request.args.get("region","greater_accra")
+    if region_key not in GHANA_REGIONS: region_key = "greater_accra"
+    sid = get_session_id()
+    with get_db() as db:
+        db.execute("UPDATE users SET region=? WHERE session_id=?", (region_key, sid))
+        db.commit()
     return jsonify(get_weather(region_key))
 
-@app.route("/api/prices")
-def api_prices():
-    return jsonify(PRICE_DATA)
-
-@app.route("/api/pests")
-def api_pests():
-    return jsonify(PEST_DATA)
-
-@app.route("/api/diagnose", methods=["POST"])
-def api_diagnose():
-    if not client.api_key:
-        return jsonify({"error": "ANTHROPIC_API_KEY not set."}), 500
-
-    data       = request.get_json()
-    image_b64  = data.get("image")
-    media_type = data.get("media_type", "image/jpeg")
-    lang       = data.get("lang", "en")
-
-    if not image_b64:
-        return jsonify({"error": "No image provided"}), 400
-
-    prompt = DISEASE_PROMPT_TW if lang == "tw" else DISEASE_PROMPT_EN
-
-    def generate():
-        with client.messages.stream(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
-                    {"type": "text",  "text": prompt},
-                ],
-            }],
-        ) as stream:
-            for text in stream.text_stream:
-                yield f"data: {json.dumps({'text': text})}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return Response(stream_with_context(generate()), mimetype="text/event-stream")
-
+# ---------------------------------------------------------------------------
+# Chat API — with usage limit
+# ---------------------------------------------------------------------------
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
-    data     = request.get_json()
+    sid  = get_session_id()
+    user = get_or_create_user(sid)
+    data = request.get_json()
     messages = data.get("messages", [])
     lang     = data.get("lang", "en")
 
     if not messages:
-        return jsonify({"error": "No messages provided"}), 400
+        return jsonify({"error":"No messages provided"}), 400
     if not client.api_key:
-        return jsonify({"error": "ANTHROPIC_API_KEY not set."}), 500
+        return jsonify({"error":"ANTHROPIC_API_KEY not set"}), 500
 
-    system = SYSTEM_PROMPT_TW if lang == "tw" else SYSTEM_PROMPT_EN
+    # Usage limit check
+    if not is_pro(user):
+        used = get_usage_today(sid)
+        if used >= FREE_DAILY_LIMIT:
+            return jsonify({
+                "error": "limit_reached",
+                "message": "You have used all 5 free questions today. Upgrade to Pro for unlimited access.",
+                "message_tw": "Woafa wo nsɛmmisa 5 nyinaa nnɛ. Sesa akɔ Pro na wanya a wopɛ nyinaa.",
+                "used": used,
+                "limit": FREE_DAILY_LIMIT
+            }), 429
+
+    last_question = messages[-1]["content"] if messages else ""
+    log_usage(sid, "chat", last_question)
+
+    system = SYSTEM_TW if lang == "tw" else SYSTEM_EN
 
     def generate():
         with client.messages.stream(
             model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=system,
-            messages=messages,
+            max_tokens=1024, system=system, messages=messages,
         ) as stream:
             for text in stream.text_stream:
                 yield f"data: {json.dumps({'text': text})}\n\n"
         yield "data: [DONE]\n\n"
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+# ---------------------------------------------------------------------------
+# Diagnose API — with usage limit
+# ---------------------------------------------------------------------------
+@app.route("/api/diagnose", methods=["POST"])
+def api_diagnose():
+    sid  = get_session_id()
+    user = get_or_create_user(sid)
+
+    if not client.api_key:
+        return jsonify({"error":"ANTHROPIC_API_KEY not set"}), 500
+
+    if not is_pro(user):
+        used = get_diagnose_this_month(sid)
+        if used >= FREE_DIAGNOSE_LIMIT:
+            return jsonify({
+                "error": "limit_reached",
+                "message": f"You have used all {FREE_DIAGNOSE_LIMIT} free diagnoses this month. Upgrade to Pro for unlimited."
+            }), 429
+
+    data       = request.get_json()
+    image_b64  = data.get("image")
+    media_type = data.get("media_type","image/jpeg")
+    lang       = data.get("lang","en")
+
+    if not image_b64:
+        return jsonify({"error":"No image provided"}), 400
+
+    log_usage(sid, "diagnose", "photo diagnosis")
+    prompt = DISEASE_TW if lang == "tw" else DISEASE_EN
+
+    def generate():
+        with client.messages.stream(
+            model="claude-sonnet-4-20250514", max_tokens=1024,
+            messages=[{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":media_type,"data":image_b64}},
+                {"type":"text","text":prompt}
+            ]}],
+        ) as stream:
+            for text in stream.text_stream:
+                yield f"data: {json.dumps({'text': text})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+# ---------------------------------------------------------------------------
+# Paystack — initialise payment
+# ---------------------------------------------------------------------------
+@app.route("/api/pay/init", methods=["POST"])
+def pay_init():
+    sid  = get_session_id()
+    data = request.get_json()
+    email = data.get("email","")
+
+    if not PAYSTACK_SECRET:
+        return jsonify({"error":"Paystack not configured"}), 500
+    if not email:
+        return jsonify({"error":"Email required"}), 400
+
+    # Save email to user
+    with get_db() as db:
+        db.execute("UPDATE users SET email=? WHERE session_id=?", (email, sid))
+        db.commit()
+
+    # Call Paystack API
+    resp = requests.post(
+        "https://api.paystack.co/transaction/initialize",
+        headers={"Authorization": f"Bearer {PAYSTACK_SECRET}",
+                 "Content-Type": "application/json"},
+        json={"email": email, "amount": 3000,          # GHS 30 = 3000 pesewas
+              "currency": "GHS",
+              "callback_url": request.host_url + "pay/verify",
+              "metadata": {"session_id": sid}}
+    )
+    result = resp.json()
+    if result.get("status"):
+        ref = result["data"]["reference"]
+        with get_db() as db:
+            db.execute("INSERT OR REPLACE INTO payments (session_id,reference,amount,status) VALUES (?,?,3000,'pending')",
+                       (sid, ref))
+            db.commit()
+        return jsonify({"authorization_url": result["data"]["authorization_url"],
+                        "reference": ref})
+    return jsonify({"error": result.get("message","Payment init failed")}), 400
+
+# ---------------------------------------------------------------------------
+# Paystack — verify payment (callback)
+# ---------------------------------------------------------------------------
+@app.route("/pay/verify")
+def pay_verify():
+    ref = request.args.get("reference","")
+    if not ref or not PAYSTACK_SECRET:
+        return redirect("/?payment=failed")
+
+    resp = requests.get(
+        f"https://api.paystack.co/transaction/verify/{ref}",
+        headers={"Authorization": f"Bearer {PAYSTACK_SECRET}"}
+    )
+    result = resp.json()
+
+    if result.get("status") and result["data"]["status"] == "success":
+        meta = result["data"].get("metadata",{})
+        sid  = meta.get("session_id", get_session_id())
+        with get_db() as db:
+            db.execute("UPDATE payments SET status='success' WHERE reference=?", (ref,))
+            db.execute("UPDATE users SET plan='pro', pro_since=datetime('now'), paystack_ref=? WHERE session_id=?",
+                       (ref, sid))
+            db.commit()
+        session["sid"] = sid
+        return redirect("/?payment=success")
+
+    return redirect("/?payment=failed")
+
+# ---------------------------------------------------------------------------
+# Usage status API (for frontend counter)
+# ---------------------------------------------------------------------------
+@app.route("/api/usage")
+def api_usage():
+    sid  = get_session_id()
+    user = get_or_create_user(sid)
+    return jsonify({
+        "plan":           user["plan"],
+        "used_today":     get_usage_today(sid),
+        "used_diagnose":  get_diagnose_this_month(sid),
+        "free_limit":     FREE_DAILY_LIMIT,
+        "diagnose_limit": FREE_DIAGNOSE_LIMIT,
+    })
+
+# ---------------------------------------------------------------------------
+# Admin dashboard
+# ---------------------------------------------------------------------------
+@app.route("/admin", methods=["GET","POST"])
+def admin():
+    if request.method == "POST":
+        if request.form.get("password") == ADMIN_PASSWORD:
+            session["admin"] = True
+        else:
+            return render_template("admin_login.html", error="Wrong password")
+
+    if not session.get("admin"):
+        return render_template("admin_login.html", error=None)
+
+    with get_db() as db:
+        total_users   = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        pro_users     = db.execute("SELECT COUNT(*) FROM users WHERE plan='pro'").fetchone()[0]
+        total_revenue = pro_users * 30
+        questions_today = db.execute(
+            "SELECT COUNT(*) FROM usage WHERE type='chat' AND date(created_at)=date('now')"
+        ).fetchone()[0]
+        diagnoses_today = db.execute(
+            "SELECT COUNT(*) FROM usage WHERE type='diagnose' AND date(created_at)=date('now')"
+        ).fetchone()[0]
+        top_questions = db.execute(
+            "SELECT question, COUNT(*) as cnt FROM usage WHERE type='chat' AND question IS NOT NULL "
+            "GROUP BY question ORDER BY cnt DESC LIMIT 10"
+        ).fetchall()
+        recent_users = db.execute(
+            "SELECT * FROM users ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        region_stats = db.execute(
+            "SELECT region, COUNT(*) as cnt FROM users GROUP BY region ORDER BY cnt DESC"
+        ).fetchall()
+
+    return render_template("admin.html",
+        total_users=total_users, pro_users=pro_users,
+        total_revenue=total_revenue,
+        questions_today=questions_today, diagnoses_today=diagnoses_today,
+        top_questions=top_questions, recent_users=recent_users,
+        region_stats=region_stats, regions=GHANA_REGIONS,
+    )
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.pop("admin", None)
+    return redirect("/admin")
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n🌿 FarmWise AI starting...")
     print("   API key set:", bool(client.api_key))
+    print("   Paystack set:", bool(PAYSTACK_SECRET))
     print("   Open: http://localhost:5000\n")
     app.run(debug=True, port=5000)
